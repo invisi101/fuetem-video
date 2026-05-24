@@ -49,13 +49,13 @@ QWidget#MainWindow {
     background: qlineargradient(y1:0, y2:1,
         stop:0 #0f0f23, stop:1 #12122e);
 }
-QLabel { color: #e0e0ff; }
+QLabel { color: #e0e0ff; font-size: 15px; }
 QLabel#brandLarge { color: #f472b6; padding-top: 8px; padding-bottom: 8px; }
 QLabel#sectionLabel { color: #f472b6; font-weight: 600; font-size: 15px; }
 QLabel#statusLabel  { color: #a5b4fc; font-size: 15px; }
-QLabel#timeLabel    { color: #c4c4f0; font-size: 14px; font-family: monospace; }
-QLabel#fileInfoLabel { color: rgba(196,196,240,0.6); font-size: 13px; }
-QLabel#dimLabel     { color: rgba(196,196,240,0.4); font-size: 12px; }
+QLabel#timeLabel    { color: #c4c4f0; font-size: 15px; font-family: monospace; }
+QLabel#fileInfoLabel { color: rgba(196,196,240,0.6); font-size: 15px; }
+QLabel#dimLabel     { color: rgba(196,196,240,0.4); font-size: 14px; }
 
 QLineEdit, QSpinBox, QDoubleSpinBox {
     background-color: #16213e;
@@ -63,7 +63,7 @@ QLineEdit, QSpinBox, QDoubleSpinBox {
     border-radius: 6px;
     color: #e0e0ff;
     padding: 5px 10px;
-    font-size: 14px;
+    font-size: 15px;
     selection-background-color: #818cf8;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
@@ -92,7 +92,7 @@ QComboBox {
     border-radius: 6px;
     color: #e0e0ff;
     padding: 5px 10px;
-    font-size: 14px;
+    font-size: 15px;
     min-width: 80px;
 }
 QComboBox:focus, QComboBox:hover { border: 1px solid #818cf8; }
@@ -112,7 +112,7 @@ QComboBox QAbstractItemView {
     outline: none;
 }
 
-QCheckBox { color: #c4c4f0; spacing: 6px; font-size: 13px; }
+QCheckBox { color: #c4c4f0; spacing: 6px; font-size: 15px; }
 QCheckBox::indicator {
     width: 16px; height: 16px;
     border-radius: 3px;
@@ -186,7 +186,7 @@ QPushButton#cancelBtn:hover {
 QPushButton#openBtn {
     background-color: transparent; color: #06b6d4;
     border: 1px solid rgba(6,182,212,0.35); border-radius: 7px;
-    padding: 6px 16px; font-size: 14px;
+    padding: 6px 16px; font-size: 15px;
 }
 QPushButton#openBtn:hover {
     border-color: rgba(6,182,212,0.7);
@@ -211,7 +211,7 @@ QPushButton#transportBtn:checked {
 QPushButton#nudgeBtn {
     background-color: #16213e; color: #818cf8;
     border: 1px solid #2d2d5e; border-radius: 4px;
-    font-size: 13px; font-weight: bold; padding: 0px;
+    font-size: 15px; font-weight: bold; padding: 0px;
 }
 QPushButton#nudgeBtn:hover {
     border-color: rgba(129,140,248,0.6);
@@ -221,7 +221,7 @@ QPushButton#nudgeBtn:hover {
 QPushButton#smallBtn {
     background-color: transparent; color: #818cf8;
     border: 1px solid rgba(129,140,248,0.3); border-radius: 5px;
-    padding: 4px 10px; font-size: 13px;
+    padding: 4px 10px; font-size: 15px;
 }
 QPushButton#smallBtn:hover {
     border-color: rgba(129,140,248,0.7);
@@ -232,7 +232,7 @@ QPushButton#smallBtn:disabled { color: rgba(129,140,248,0.3); }
 QPushButton#dangerBtn {
     background-color: transparent; color: #f87171;
     border: 1px solid rgba(248,113,113,0.3); border-radius: 7px;
-    padding: 8px 18px; font-size: 14px;
+    padding: 8px 18px; font-size: 15px;
 }
 QPushButton#dangerBtn:hover {
     border-color: rgba(248,113,113,0.7);
@@ -242,7 +242,7 @@ QPushButton#dangerBtn:hover {
 QPushButton#recentBtn {
     background-color: transparent; color: #a5b4fc;
     border: 1px solid rgba(129,140,248,0.2); border-radius: 5px;
-    padding: 5px 12px; font-size: 13px;
+    padding: 5px 12px; font-size: 15px;
 }
 QPushButton#recentBtn:hover {
     border-color: rgba(129,140,248,0.5);
@@ -286,7 +286,7 @@ QTabBar::tab {
     border: 1px solid rgba(45,45,94,0.5);
     border-bottom: none;
     padding: 5px 10px;
-    font-size: 12px;
+    font-size: 14px;
     min-width: 68px;
     margin-right: 2px;
     border-radius: 5px 5px 0 0;
@@ -306,7 +306,7 @@ QListWidget {
     border: 1px solid #2d2d5e;
     border-radius: 6px;
     color: #e0e0ff;
-    font-size: 13px;
+    font-size: 15px;
     outline: none;
 }
 QListWidget::item { padding: 5px 8px; }
@@ -324,16 +324,16 @@ QTextEdit {
     border-radius: 6px;
     color: #c4c4f0;
     font-family: monospace;
-    font-size: 12px;
+    font-size: 13px;
     selection-background-color: rgba(129,140,248,0.3);
 }
 
 QMessageBox { background-color: #1a1a2e; }
-QMessageBox QLabel { color: #e0e0ff; font-size: 13px; }
+QMessageBox QLabel { color: #e0e0ff; font-size: 15px; }
 QMessageBox QPushButton {
     background-color: #2d2d5e; color: #e0e0ff;
     border: 1px solid rgba(129,140,248,0.3);
-    border-radius: 5px; padding: 5px 18px; font-size: 13px;
+    border-radius: 5px; padding: 5px 18px; font-size: 15px;
 }
 QMessageBox QPushButton:hover { background-color: rgba(129,140,248,0.2); }
 
