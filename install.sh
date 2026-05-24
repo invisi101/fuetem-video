@@ -16,23 +16,60 @@ check_python() {
 
 missing_deps() {
     local missing=()
-    python3 -c "import PyQt5" 2>/dev/null                    || missing+=("pyqt5")
+    python3 -c "import PyQt5" 2>/dev/null \
+        || missing+=("pyqt5")
     python3 -c "from PyQt5.QtMultimedia import QMediaPlayer" 2>/dev/null \
-                                                               || missing+=("qt5-multimedia")
+        || missing+=("qt5-multimedia")
     python3 -c "from PyQt5.QtMultimediaWidgets import QVideoWidget" 2>/dev/null \
-                                                               || missing+=("qt5-multimedia-widgets")
-    command -v ffmpeg &>/dev/null                              || missing+=("ffmpeg")
+        || missing+=("qt5-multimedia-widgets")
+    command -v ffmpeg &>/dev/null \
+        || missing+=("ffmpeg")
+
+    # Check GStreamer backend — try instantiating a player and probing availability.
+    # p.service() is deprecated in Qt 5.15+; fall back to isAvailable().
     if ! python3 -c "
 from PyQt5.QtMultimedia import QMediaPlayer
 from PyQt5.QtWidgets import QApplication
 import sys
 app = QApplication.instance() or QApplication(sys.argv)
 p = QMediaPlayer()
-exit(0 if p.service() else 1)
+if hasattr(p, 'service'):
+    ok = p.service() is not None
+else:
+    ok = p.isAvailable()
+sys.exit(0 if ok else 1)
 " 2>/dev/null; then
         missing+=("gst-libav")
     fi
+
     echo "${missing[@]}"
+}
+
+# Enable RPM Fusion Free on Fedora — required for ffmpeg and gstreamer1-libav.
+enable_rpmfusion() {
+    if rpm -q rpmfusion-free-release &>/dev/null; then
+        return 0
+    fi
+    local ver
+    ver=$(rpm -E %fedora 2>/dev/null)
+    if [[ -z "$ver" || "$ver" == "%fedora" ]]; then
+        echo ""
+        echo "WARNING: Could not detect Fedora version."
+        echo "  ffmpeg and GStreamer codecs require RPM Fusion Free."
+        echo "  See: https://rpmfusion.org/Configuration"
+        return 1
+    fi
+    echo "Enabling RPM Fusion Free (required for ffmpeg / GStreamer codecs)…"
+    sudo dnf install -y \
+        "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${ver}.noarch.rpm"
+}
+
+# Deduplicate an array while preserving order.
+dedup() {
+    local -A seen=()
+    for item in "$@"; do
+        [[ -z "${seen[$item]+x}" ]] && { echo "$item"; seen[$item]=1; }
+    done
 }
 
 install_deps() {
@@ -51,6 +88,7 @@ install_deps() {
         for dep in "${pkgs[@]}"; do
             to_install+=( ${pm_map[$dep]} )
         done
+        mapfile -t to_install < <(dedup "${to_install[@]}")
         echo "Installing: ${to_install[*]}"
         sudo pacman -S --needed --noconfirm "${to_install[@]}"
 
@@ -59,19 +97,27 @@ install_deps() {
             [pyqt5]="python3-pyqt5"
             [qt5-multimedia]="python3-pyqt5.qtmultimedia"
             [qt5-multimedia-widgets]="python3-pyqt5.qtmultimedia"
-            [gst-libav]="gstreamer1.0-plugins-good gstreamer1.0-libav"
+            [gst-libav]="gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-plugins-bad"
             [ffmpeg]="ffmpeg"
         )
         local to_install=()
         for dep in "${pkgs[@]}"; do
             to_install+=( ${pm_map[$dep]} )
         done
+        mapfile -t to_install < <(dedup "${to_install[@]}")
         echo "Installing: ${to_install[*]}"
         sudo apt-get install -y "${to_install[@]}"
 
     elif command -v dnf &>/dev/null; then
+        # ffmpeg and gstreamer1-libav are in RPM Fusion Free, not default Fedora repos.
+        local needs_rpmfusion=false
+        for dep in "${pkgs[@]}"; do
+            [[ "$dep" == "ffmpeg" || "$dep" == "gst-libav" ]] && needs_rpmfusion=true
+        done
+        $needs_rpmfusion && enable_rpmfusion
+
         declare -A pm_map=(
-            [pyqt5]="python3-qt5"
+            [pyqt5]="python3-PyQt5"
             [qt5-multimedia]="qt5-qtmultimedia"
             [qt5-multimedia-widgets]="qt5-qtmultimedia"
             [gst-libav]="gstreamer1-plugins-good gstreamer1-libav"
@@ -81,13 +127,14 @@ install_deps() {
         for dep in "${pkgs[@]}"; do
             to_install+=( ${pm_map[$dep]} )
         done
+        mapfile -t to_install < <(dedup "${to_install[@]}")
         echo "Installing: ${to_install[*]}"
         sudo dnf install -y "${to_install[@]}"
 
     elif command -v zypper &>/dev/null; then
         declare -A pm_map=(
             [pyqt5]="python3-qt5"
-            [qt5-multimedia]="libqt5-qtmultimedia"
+            [qt5-multimedia]="libqt5-qtmultimedia python3-qt5"
             [qt5-multimedia-widgets]="libqt5-qtmultimedia"
             [gst-libav]="gstreamer-plugins-good gstreamer-plugins-libav"
             [ffmpeg]="ffmpeg"
@@ -96,6 +143,7 @@ install_deps() {
         for dep in "${pkgs[@]}"; do
             to_install+=( ${pm_map[$dep]} )
         done
+        mapfile -t to_install < <(dedup "${to_install[@]}")
         echo "Installing: ${to_install[*]}"
         sudo zypper install -y "${to_install[@]}"
 
