@@ -729,10 +729,10 @@ class ThumbnailTimeline(QtWidgets.QWidget):
 
 
 class TimeSpinWidget(QtWidgets.QWidget):
-    STEP_MS = 100
-
     def __init__(self, label: str):
         super().__init__()
+        self._step_ms = 100   # updated to 1-frame duration when a file is loaded
+
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
@@ -755,6 +755,10 @@ class TimeSpinWidget(QtWidgets.QWidget):
         self._plus.clicked.connect(self._nudge_plus)
         lay.addWidget(self._plus)
 
+    def set_fps(self, fps: float):
+        """Set nudge step to one frame duration for the given frame rate."""
+        self._step_ms = round(1000 / fps) if fps > 0 else 100
+
     def text(self) -> str:      return self._edit.text()
     def setText(self, t: str):  self._edit.setText(t)
 
@@ -768,8 +772,8 @@ class TimeSpinWidget(QtWidgets.QWidget):
         except ValueError:
             pass
 
-    def _nudge_minus(self): self._nudge(-self.STEP_MS)
-    def _nudge_plus(self):  self._nudge(+self.STEP_MS)
+    def _nudge_minus(self): self._nudge(-self._step_ms)
+    def _nudge_plus(self):  self._nudge(+self._step_ms)
 
 
 class DragFileList(QtWidgets.QListWidget):
@@ -952,6 +956,9 @@ class TrimSplitPage(QtWidgets.QWidget):
 
     def on_file_loaded(self):
         pd = self.ctrl.probe_data
+        fps = pd.get("fps", 25.0)
+        self.trim_start.set_fps(fps)
+        self.trim_end.set_fps(fps)
         self.trim_start.setText("00:00:00.000")
         self.trim_end.setText(_secs_to_timestr(pd.get("duration", 0)))
         self._refresh_controls()
