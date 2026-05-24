@@ -629,6 +629,19 @@ class ThumbnailTimeline(QtWidgets.QWidget):
         self._thumbs: list = []
         self._position = 0.0
         self._loading  = False
+        self._worker: ThumbnailWorker | None = None
+
+    def load_file(self, path: str, duration: float):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait()
+        self.clear()
+        self.set_loading(True)
+        count = min(MAX_THUMBS, max(20, int(self.width() / 12) or 40))
+        self._worker = ThumbnailWorker(path, count)
+        self._worker.thumbnail_ready.connect(self.add_thumbnail)
+        self._worker.finished.connect(lambda _: self.set_loading(False))
+        self._worker.start()
 
     def set_loading(self, v: bool):
         self._loading = v
@@ -967,7 +980,6 @@ class TrimSplitPage(QtWidgets.QWidget):
         if not self.ctrl.current_file:
             return
         pos_s  = self.ctrl.player.position() / 1000
-        dur_ms = self.ctrl.player.duration()
         if pos_s <= 0:
             QtWidgets.QMessageBox.warning(self, "No Position",
                                           "Seek to a position first.")
@@ -1331,7 +1343,7 @@ class ConvertPage(QtWidgets.QWidget):
         cmd1 = cmd1[:-1]  # remove output
         cmd1.extend(["-pass", "1", "-f", "null", "/dev/null"])
         cmd_pass2 = cmd_pass2[:-1] + ["-pass", "2", out]
-        self.ctrl._run_multi([cmd1, cmd_pass2], "Two-pass encode…", total_secs=dur)
+        self.ctrl._run_multi([cmd1, cmd_pass2], "Two-pass encode…")
 
 
 # ── Page: Filters ─────────────────────────────────────────────────────────────
@@ -2268,12 +2280,11 @@ class FramesPage(QtWidgets.QWidget):
         pat = self.imgseq_pat.text().strip() or "*.jpg"
         fps = self.imgseq_fps.value()
         codec = self.imgseq_codec.currentText()
-        cmd = ["ffmpeg", "-y",
+        cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-framerate", f"{fps:.3f}",
                "-pattern_type", "glob",
                "-i", str(Path(folder) / pat),
-               "-c:v", codec, "-pix_fmt", "yuv420p",
-               "-progress", "pipe:1", "-nostats", out]
+               "-c:v", codec, "-pix_fmt", "yuv420p", out]
         self.ctrl._run_ffmpeg(cmd, 0, "Building video from images…")
 
 
@@ -2704,7 +2715,6 @@ class AnalysePage(QtWidgets.QWidget):
         if not self.ctrl.current_file: return
         self.ctrl._set_status("Checking for errors…")
         self.ctrl._set_busy(True)
-        self._worker = QtCore.QThread()
 
         class _Runner(QtCore.QThread):
             done = QtCore.pyqtSignal(str)
@@ -2894,7 +2904,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         btn_row = QtWidgets.QHBoxLayout()
         open_btn = QtWidgets.QPushButton("Open…")
-        open_btn.setObjectName("primaryBtn")
+        open_btn.setObjectName("actionBtn")
         open_btn.clicked.connect(self._open_file)
         btn_row.addWidget(open_btn)
 
@@ -3064,7 +3074,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._seeking and dur > 0:
             self.seek_slider.setValue(int(pos_ms / dur * 1000))
         if dur > 0:
-            self.timeline.set_playhead(pos_ms / dur)
+            self.timeline.set_position(pos_ms / dur)
         if (self.loop_btn.isChecked()
                 and self.player.state() != QMediaPlayer.StoppedState
                 and dur > 0 and pos_ms >= dur - 100):
@@ -3195,7 +3205,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._ffmpeg_worker and self._ffmpeg_worker.isRunning():
             self._ffmpeg_worker.cancel()
         if self._multi_worker and self._multi_worker.isRunning():
-            self._multi_worker.terminate()
+            self._multi_worker.cancel()
         self._set_busy(False)
         self._set_status("Cancelled.")
 
