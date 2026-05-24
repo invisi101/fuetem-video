@@ -2881,6 +2881,287 @@ class AnalysePage(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "Error Check", msg)
 
 
+# ── Page: Privacy ─────────────────────────────────────────────────────────────
+
+_NEVER_REMOVE = frozenset({
+    "rotate", "rotation", "stereo_mode",
+})
+
+_PRIVACY_KEYS = frozenset({
+    # GPS / location
+    "com.apple.quicktime.location.iso6709",
+    "com.apple.quicktime.location.accuracy.horizontal",
+    "location", "location-eng", "gps_coordinates", "gps",
+    # device identity
+    "com.apple.quicktime.make", "com.apple.quicktime.model",
+    "com.apple.quicktime.software", "com.apple.quicktime.description",
+    "com.android.manufacturer", "com.android.model", "com.android.version",
+    "make", "model", "software",
+    # timestamps
+    "com.apple.quicktime.creationdate", "creation_time", "date",
+    # encoder / tool info
+    "encoder", "encoded_by", "encoding_tool",
+    # ownership / legal
+    "copyright", "com.apple.quicktime.copyright",
+    "artist", "album_artist", "description",
+})
+
+
+class PrivacyPage(QtWidgets.QWidget):
+    _COL_CHECK = 0
+    _COL_SRC   = 1
+    _COL_KEY   = 2
+    _COL_VAL   = 3
+
+    def __init__(self, ctrl):
+        super().__init__()
+        self.ctrl = ctrl
+        self._rows: list = []   # list of dicts: {source, key, value, stream_in, stream_type}
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(10)
+
+        # data tracks card (only visible when data streams present)
+        self._data_card = QtWidgets.QFrame()
+        self._data_card.setObjectName("privacyDataCard")
+        self._data_card.setStyleSheet(
+            "#privacyDataCard { background: #1a1040; border: 1px solid #f472b6; "
+            "border-radius: 8px; }")
+        dc_lay = QtWidgets.QVBoxLayout(self._data_card)
+        dc_lay.setContentsMargins(14, 10, 14, 10)
+        dc_lay.setSpacing(6)
+
+        hdr = QtWidgets.QLabel("DEVICE DATA TRACKS")
+        hdr.setObjectName("sectionLabel")
+        hdr.setStyleSheet("color: #f472b6;")
+        dc_lay.addWidget(hdr)
+
+        self._data_tracks_cb = QtWidgets.QCheckBox("Remove device data tracks (mebx, tmcd, …)")
+        self._data_tracks_cb.setStyleSheet("color: #e0e0ff;")
+        dc_lay.addWidget(self._data_tracks_cb)
+
+        self._data_tracks_desc = QtWidgets.QLabel()
+        self._data_tracks_desc.setStyleSheet("color: #9494c0;")
+        self._data_tracks_desc.setWordWrap(True)
+        dc_lay.addWidget(self._data_tracks_desc)
+
+        lay.addWidget(self._data_card)
+        self._data_card.setVisible(False)
+
+        # tags card
+        tags_card = QtWidgets.QFrame()
+        tags_card.setObjectName("card")
+        tc_lay = QtWidgets.QVBoxLayout(tags_card)
+        tc_lay.setContentsMargins(14, 10, 14, 10)
+        tc_lay.setSpacing(8)
+
+        hdr2 = QtWidgets.QLabel("METADATA FIELDS")
+        hdr2.setObjectName("sectionLabel")
+        tc_lay.addWidget(hdr2)
+
+        sel_row = QtWidgets.QHBoxLayout()
+        sel_row.setSpacing(8)
+        for label, slot in [
+            ("Select Privacy-Sensitive", self._select_privacy),
+            ("Select All",              self._select_all),
+            ("Deselect All",            self._deselect_all),
+        ]:
+            btn = QtWidgets.QPushButton(label)
+            btn.setObjectName("actionBtn")
+            btn.clicked.connect(slot)
+            sel_row.addWidget(btn)
+        sel_row.addStretch(1)
+        tc_lay.addLayout(sel_row)
+
+        self._table = QtWidgets.QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["", "Source", "Key", "Value"])
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self._table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(
+            "QTableWidget { background: #0f0f23; gridline-color: #2d2d5e; "
+            "alternate-background-color: #16213e; color: #e0e0ff; border: none; }"
+            "QHeaderView::section { background: #16213e; color: #818cf8; "
+            "border: 1px solid #2d2d5e; padding: 4px; }")
+        self._table.setMinimumHeight(300)
+        tc_lay.addWidget(self._table)
+
+        strip_row = QtWidgets.QHBoxLayout()
+        strip_row.addStretch(1)
+        self.strip_btn = QtWidgets.QPushButton("Strip Selected…")
+        self.strip_btn.setObjectName("actionBtn")
+        self.strip_btn.clicked.connect(self._do_strip)
+        strip_row.addWidget(self.strip_btn)
+        tc_lay.addLayout(strip_row)
+
+        lay.addWidget(tags_card, 1)
+        self._refresh_controls()
+
+    def on_file_loaded(self):
+        pd = self.ctrl.probe_data
+        self._rows = []
+        self._table.setRowCount(0)
+
+        # format-level tags
+        for k, v in pd.get("tags", {}).items():
+            if k.lower() in _NEVER_REMOVE:
+                continue
+            self._add_row("Format", k, str(v), stream_in=None)
+
+        # stream-level tags (video, audio, subtitle — not data)
+        type_order = (
+            [(s, "video")    for s in pd.get("video_streams", [])] +
+            [(s, "audio")    for s in pd.get("audio_streams", [])] +
+            [(s, "subtitle") for s in pd.get("subtitle_streams", [])]
+        )
+        for s, stype in type_order:
+            idx = s.get("index", "?")
+            label = f"Stream {idx} ({stype})"
+            for k, v in s.get("tags", {}).items():
+                if k.lower() in _NEVER_REMOVE:
+                    continue
+                self._add_row(label, k, str(v), stream_in=idx)
+
+        # data tracks card
+        data_streams = pd.get("data_streams", [])
+        if data_streams:
+            tags = [s.get("codec_tag_string", "data") for s in data_streams]
+            self._data_tracks_desc.setText(
+                f"{len(data_streams)} track(s): {', '.join(t for t in tags if t)}")
+            self._data_tracks_cb.setChecked(True)
+            self._data_card.setVisible(True)
+        else:
+            self._data_card.setVisible(False)
+
+        self._refresh_controls()
+
+    def _add_row(self, source: str, key: str, value: str, stream_in):
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+
+        is_priv = key.lower() in _PRIVACY_KEYS
+
+        cb = QtWidgets.QTableWidgetItem()
+        cb.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+        cb.setCheckState(QtCore.Qt.Checked if is_priv else QtCore.Qt.Unchecked)
+        self._table.setItem(row, self._COL_CHECK, cb)
+
+        src_item = QtWidgets.QTableWidgetItem(source)
+        src_item.setForeground(QtGui.QColor("#818cf8"))
+        self._table.setItem(row, self._COL_SRC, src_item)
+
+        key_item = QtWidgets.QTableWidgetItem(key)
+        if is_priv:
+            key_item.setForeground(QtGui.QColor("#f472b6"))
+        self._table.setItem(row, self._COL_KEY, key_item)
+
+        self._table.setItem(row, self._COL_VAL, QtWidgets.QTableWidgetItem(value))
+
+        self._rows.append({
+            "source":    source,
+            "key":       key,
+            "value":     value,
+            "stream_in": stream_in,
+        })
+
+    def _select_privacy(self):
+        for r in range(self._table.rowCount()):
+            key = self._table.item(r, self._COL_KEY).text().lower()
+            state = QtCore.Qt.Checked if key in _PRIVACY_KEYS else QtCore.Qt.Unchecked
+            self._table.item(r, self._COL_CHECK).setCheckState(state)
+
+    def _select_all(self):
+        for r in range(self._table.rowCount()):
+            self._table.item(r, self._COL_CHECK).setCheckState(QtCore.Qt.Checked)
+
+    def _deselect_all(self):
+        for r in range(self._table.rowCount()):
+            self._table.item(r, self._COL_CHECK).setCheckState(QtCore.Qt.Unchecked)
+
+    def _refresh_controls(self):
+        self.strip_btn.setEnabled(self.ctrl.current_file is not None)
+
+    def _do_strip(self):
+        if not self.ctrl.current_file:
+            return
+
+        pd = self.ctrl.probe_data
+        fmt_tags = pd.get("tags", {})
+        remove_data = self._data_tracks_cb.isChecked() and self._data_card.isVisible()
+
+        checked_rows = {r for r in range(self._table.rowCount())
+                        if self._table.item(r, self._COL_CHECK).checkState()
+                        == QtCore.Qt.Checked}
+
+        if not checked_rows and not remove_data:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing Selected", "No fields are checked.")
+            return
+
+        src = Path(self.ctrl.current_file)
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Stripped File",
+            str(src.parent / f"{src.stem}_private{src.suffix}"),
+            "All Files (*)")
+        if not out:
+            return
+
+        cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
+               "-i", self.ctrl.current_file]
+
+        # stream mapping
+        if remove_data:
+            for s in (pd.get("video_streams", []) +
+                      pd.get("audio_streams", []) +
+                      pd.get("subtitle_streams", [])):
+                cmd += ["-map", f"0:{s['index']}"]
+        else:
+            cmd += ["-map", "0"]
+
+        # format-level: clear all, re-add unchecked
+        checked_fmt_keys = {self._rows[r]["key"]
+                            for r in checked_rows
+                            if self._rows[r]["stream_in"] is None}
+        cmd += ["-map_metadata", "-1"]
+        for k, v in fmt_tags.items():
+            if k.lower() not in _NEVER_REMOVE and k not in checked_fmt_keys:
+                cmd += ["-metadata", f"{k}={v}"]
+
+        # per-stream: only touch streams that have checked tags
+        kept_streams = (pd.get("video_streams", []) +
+                        pd.get("audio_streams", []) +
+                        pd.get("subtitle_streams", []))
+        if not remove_data:
+            kept_streams += pd.get("data_streams", [])
+
+        for out_i, s in enumerate(kept_streams):
+            in_idx = s.get("index")
+            stream_tags = s.get("tags", {})
+            if not stream_tags:
+                continue
+            checked_stream_keys = {self._rows[r]["key"]
+                                   for r in checked_rows
+                                   if self._rows[r]["stream_in"] == in_idx}
+            if not checked_stream_keys:
+                continue
+            cmd += [f"-map_metadata:s:{out_i}", "-1"]
+            for k, v in stream_tags.items():
+                if k.lower() not in _NEVER_REMOVE and k not in checked_stream_keys:
+                    cmd += [f"-metadata:s:{out_i}", f"{k}={v}"]
+
+        cmd += ["-c", "copy", out]
+        self.ctrl._run_ffmpeg(cmd, pd.get("duration", 0), "Stripping selected fields…")
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -3091,6 +3372,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Subtitles",    SubtitlesPage),
             ("Metadata",     MetadataPage),
             ("Analyse",      AnalysePage),
+            ("Privacy",      PrivacyPage),
         ]:
             page = cls(self)
             self._pages[name] = page
