@@ -412,6 +412,26 @@ def _probe(path: str) -> dict:
     result["video_streams"]    = [s for s in streams if s.get("codec_type") == "video"]
     result["audio_streams"]    = [s for s in streams if s.get("codec_type") == "audio"]
     result["subtitle_streams"] = [s for s in streams if s.get("codec_type") == "subtitle"]
+    result["data_streams"]     = [s for s in streams if s.get("codec_type") == "data"]
+
+    # Parse Apple QuickTime device metadata
+    tag_lc = {k.lower(): v for k, v in result["tags"].items()}
+    device = {}
+    for qt_key, short in [
+        ("com.apple.quicktime.make",              "make"),
+        ("com.apple.quicktime.model",             "model"),
+        ("com.apple.quicktime.software",          "software"),
+        ("com.apple.quicktime.creationdate",      "creation_date"),
+        ("com.apple.quicktime.location.iso6709",  "location"),
+        ("com.apple.quicktime.location.accuracy.horizontal", "location_accuracy"),
+    ]:
+        v = tag_lc.get(qt_key, "")
+        if v:
+            device[short] = v
+    if not device.get("creation_date"):
+        device["creation_date"] = tag_lc.get("creation_time", "")
+    if device:
+        result["device_info"] = device
 
     if result["video_streams"]:
         vs = result["video_streams"][0]
@@ -455,6 +475,18 @@ def _atempo_chain(speed: float) -> list:
     if abs(remaining - 1.0) > 0.001:
         filters.append(f"atempo={remaining:.6f}")
     return filters
+
+
+def _parse_iso6709(s: str):
+    """Return (lat, lon) floats from an ISO 6709 string like +35.7070+139.7366+012/"""
+    import re
+    m = re.match(r'([+-]\d+\.?\d*)([+-]\d+\.?\d*)', s.strip())
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
+    return None
 
 
 def _overlay_expr(pos: str, margin: int = 10) -> str:
@@ -2668,10 +2700,51 @@ class AnalysePage(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10); lay.setSpacing(10)
 
+        # ── Device info card (hidden until a file with device metadata is loaded) ──
+        self.device_card = QtWidgets.QFrame()
+        self.device_card.setObjectName("card")
+        self.device_card.setStyleSheet(
+            "QFrame#card { border: 1px solid rgba(244,114,182,0.3); }")
+        dc_lay = QtWidgets.QVBoxLayout(self.device_card)
+        dc_lay.setContentsMargins(14, 10, 14, 10); dc_lay.setSpacing(8)
+        dc_hdr = QtWidgets.QHBoxLayout()
+        dc_title = QtWidgets.QLabel("DEVICE / CAMERA DATA")
+        dc_title.setObjectName("sectionLabel")
+        dc_hdr.addWidget(dc_title)
+        dc_hdr.addStretch(1)
+        self.strip_tracks_btn = QtWidgets.QPushButton("Strip Device Tracks…")
+        self.strip_tracks_btn.setObjectName("smallBtn")
+        self.strip_tracks_btn.setToolTip(
+            "Remove device data tracks (mebx/tmcd/GPS) — keeps video and audio only")
+        self.strip_tracks_btn.clicked.connect(self._do_strip_tracks)
+        dc_hdr.addWidget(self.strip_tracks_btn)
+        dc_lay.addLayout(dc_hdr)
+
+        self.device_info_label = QtWidgets.QLabel()
+        self.device_info_label.setWordWrap(True)
+        self.device_info_label.setObjectName("fileInfoLabel")
+        dc_lay.addWidget(self.device_info_label)
+
+        self.gps_row = QtWidgets.QHBoxLayout()
+        self.gps_label = QtWidgets.QLabel()
+        self.gps_label.setObjectName("fileInfoLabel")
+        self.gps_row.addWidget(self.gps_label)
+        self.copy_gps_btn = QtWidgets.QPushButton("Copy coords")
+        self.copy_gps_btn.setObjectName("smallBtn")
+        self.copy_gps_btn.clicked.connect(self._copy_gps)
+        self.gps_row.addWidget(self.copy_gps_btn)
+        self.gps_row.addStretch(1)
+        dc_lay.addLayout(self.gps_row)
+
+        self.device_card.hide()
+        lay.addWidget(self.device_card)
+
+        # ── Probe JSON card ──
         card = QtWidgets.QFrame(); card.setObjectName("card")
         clay = QtWidgets.QVBoxLayout(card)
         clay.setContentsMargins(14, 10, 14, 10); clay.setSpacing(8)
-        lbl = QtWidgets.QLabel("ANALYSE"); lbl.setObjectName("sectionLabel"); clay.addWidget(lbl)
+        lbl = QtWidgets.QLabel("ANALYSE"); lbl.setObjectName("sectionLabel")
+        clay.addWidget(lbl)
 
         self.probe_text = QtWidgets.QTextEdit()
         self.probe_text.setReadOnly(True)
@@ -2681,21 +2754,25 @@ class AnalysePage(QtWidgets.QWidget):
 
         btn_row = QtWidgets.QHBoxLayout()
         self.error_btn = QtWidgets.QPushButton("Check for Errors")
-        self.error_btn.setObjectName("smallBtn"); self.error_btn.clicked.connect(self._do_check_errors)
+        self.error_btn.setObjectName("smallBtn")
+        self.error_btn.clicked.connect(self._do_check_errors)
         btn_row.addWidget(self.error_btn)
         copy_btn = QtWidgets.QPushButton("Copy JSON")
         copy_btn.setObjectName("smallBtn")
-        copy_btn.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.probe_text.toPlainText()))
+        copy_btn.clicked.connect(
+            lambda: QtWidgets.QApplication.clipboard().setText(self.probe_text.toPlainText()))
         btn_row.addWidget(copy_btn)
         btn_row.addStretch(1)
         self.refresh_btn = QtWidgets.QPushButton("Refresh")
-        self.refresh_btn.setObjectName("smallBtn"); self.refresh_btn.clicked.connect(self._refresh)
+        self.refresh_btn.setObjectName("smallBtn")
+        self.refresh_btn.clicked.connect(self._refresh)
         btn_row.addWidget(self.refresh_btn)
         clay.addLayout(btn_row)
 
         lay.addWidget(card)
         lay.addStretch(1)
         self._refresh_controls()
+        self._gps_coords = None
 
     def on_file_loaded(self):
         self._refresh()
@@ -2703,13 +2780,80 @@ class AnalysePage(QtWidgets.QWidget):
 
     def _refresh_controls(self):
         has = self.ctrl.current_file is not None
-        self.error_btn.setEnabled(has); self.refresh_btn.setEnabled(has)
+        self.error_btn.setEnabled(has)
+        self.refresh_btn.setEnabled(has)
 
     def _refresh(self):
         if not self.ctrl.current_file: return
-        pd = self.ctrl.probe_data
+        pd  = self.ctrl.probe_data
         raw = pd.get("raw", {})
         self.probe_text.setPlainText(json.dumps(raw, indent=2, ensure_ascii=False))
+        self._populate_device_card(pd)
+
+    def _populate_device_card(self, pd: dict):
+        dev = pd.get("device_info", {})
+        data_streams = pd.get("data_streams", [])
+        if not dev and not data_streams:
+            self.device_card.hide()
+            return
+
+        lines = []
+        if dev.get("make") or dev.get("model"):
+            lines.append(f"Device: {dev.get('make', '')} {dev.get('model', '')}".strip())
+        if dev.get("software"):
+            lines.append(f"Software: {dev.get('software', '')}")
+        if dev.get("creation_date"):
+            lines.append(f"Recorded: {dev.get('creation_date', '')}")
+        if data_streams:
+            tags = [s.get("codec_tag_string", "data") for s in data_streams]
+            lines.append(f"Data tracks: {', '.join(t for t in tags if t)} "
+                         f"({len(data_streams)} stream{'s' if len(data_streams) != 1 else ''})")
+        self.device_info_label.setText("\n".join(lines))
+
+        # GPS
+        self._gps_coords = None
+        loc = dev.get("location", "")
+        if loc:
+            coords = _parse_iso6709(loc)
+            if coords:
+                lat, lon = coords
+                acc = dev.get("location_accuracy", "")
+                acc_str = f"  ±{float(acc):.0f} m" if acc else ""
+                self.gps_label.setText(
+                    f"GPS: {lat:+.6f}, {lon:+.6f}{acc_str}")
+                self._gps_coords = f"{lat:+.6f}, {lon:+.6f}"
+                self.gps_label.show()
+                self.copy_gps_btn.show()
+            else:
+                self.gps_label.hide()
+                self.copy_gps_btn.hide()
+        else:
+            self.gps_label.hide()
+            self.copy_gps_btn.hide()
+
+        self.device_card.show()
+
+    def _copy_gps(self):
+        if self._gps_coords:
+            QtWidgets.QApplication.clipboard().setText(self._gps_coords)
+            self.ctrl._set_status("GPS coordinates copied.")
+
+    def _do_strip_tracks(self):
+        if not self.ctrl.current_file: return
+        src = Path(self.ctrl.current_file)
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Clean Copy",
+            str(src.parent / f"{src.stem}_clean{src.suffix}"),
+            "All Files (*)")
+        if not out: return
+        # -map 0:v -map 0:a keeps only video and audio, dropping all data/timecode tracks
+        cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
+               "-i", self.ctrl.current_file,
+               "-map", "0:v", "-map", "0:a?",
+               "-c", "copy", out]
+        self.ctrl._run_ffmpeg(
+            cmd, self.ctrl.probe_data.get("duration", 0),
+            "Stripping device tracks…")
 
     def _do_check_errors(self):
         if not self.ctrl.current_file: return
@@ -3090,8 +3234,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_play_pause.setText("▶")
 
     def _on_player_error(self, error):
-        if error != QMediaPlayer.NoError:
-            self._set_status(f"Player error: {self.player.errorString()}")
+        if error == QMediaPlayer.NoError:
+            return
+        msg = self.player.errorString()
+        if "unknown" in msg.lower() and self.probe_data.get("data_streams"):
+            tags = [s.get("codec_tag_string", "data")
+                    for s in self.probe_data["data_streams"]]
+            self._set_status(
+                f"Device data tracks present ({', '.join(t for t in tags if t)}) "
+                f"— see Analyse tab to strip them")
+        else:
+            self._set_status(f"Player error: {msg}")
 
     # ── File loading ──────────────────────────────────────────────────────────
 
