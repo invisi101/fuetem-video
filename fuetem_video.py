@@ -3212,10 +3212,13 @@ class MainWindow(QtWidgets.QMainWindow):
         left_lay.setSpacing(6)
 
         # brand
-        brand = QtWidgets.QLabel("▶ Fuetem Video")
+        brand = QtWidgets.QLabel("Fuetem Video")
         brand.setObjectName("brandLarge")
-        brand.setStyleSheet("QLabel { color: #f472b6; font-size: 22px; font-weight: 700; "
-                            "letter-spacing: 2px; padding: 6px 0; }")
+        brand.setStyleSheet(
+            "QLabel { color: #f472b6; padding: 10px 0 4px 0;"
+            " font-family: 'Vegan Style Personal Use';"
+            " font-size: 40px; font-weight: bold; }"
+        )
         left_lay.addWidget(brand)
 
         # video widget
