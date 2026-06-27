@@ -598,7 +598,7 @@ class MultiCmdWorker(QtCore.QThread):
 
 
 class ThumbnailWorker(QtCore.QThread):
-    thumbnail_ready = QtCore.pyqtSignal(int, QtGui.QPixmap)
+    thumbnail_ready = QtCore.pyqtSignal(int, QtGui.QImage)
     finished        = QtCore.pyqtSignal(int)
 
     THUMB_H = 68
@@ -640,9 +640,11 @@ class ThumbnailWorker(QtCore.QThread):
         for i, tp in enumerate(thumbs):
             if self._cancelled:
                 break
-            pm = QtGui.QPixmap(str(tp))
-            if not pm.isNull():
-                self.thumbnail_ready.emit(i, pm)
+            # QPixmap must only be built on the GUI thread; build a QImage
+            # here (thread-safe) and convert to QPixmap in the main-thread slot.
+            img = QtGui.QImage(str(tp))
+            if not img.isNull():
+                self.thumbnail_ready.emit(i, img)
 
         self.finished.emit(len(thumbs))
 
@@ -681,7 +683,8 @@ class ThumbnailTimeline(QtWidgets.QWidget):
             self._thumbs = []
         self.update()
 
-    def add_thumbnail(self, _idx: int, pm: QtGui.QPixmap):
+    def add_thumbnail(self, _idx: int, img: QtGui.QImage):
+        pm = QtGui.QPixmap.fromImage(img)
         self._thumbs.append(pm.scaledToHeight(self.THUMB_H, QtCore.Qt.SmoothTransformation))
         self.update()
 
@@ -1324,9 +1327,16 @@ class ConvertPage(QtWidgets.QWidget):
             if vaapi:
                 enc = "hevc_vaapi" if vcodec == "libx265" else "h264_vaapi"
                 cmd.extend(["-c:v", enc, "-qp", str(self.crf_slider.value())])
+                # h264_vaapi has no 10-bit profile, so a 10-bit HEVC/AV1 source
+                # fails with "No usable encoding profile found". Force a downconvert
+                # to 8-bit nv12. hevc_vaapi keeps native bit depth (handles p010).
                 if vf:
                     vaapi_scale = vf.replace("scale=", "scale_vaapi=")
+                    if enc == "h264_vaapi":
+                        vaapi_scale += ":format=nv12"
                     cmd.extend(["-vf", vaapi_scale])
+                elif enc == "h264_vaapi":
+                    cmd.extend(["-vf", "scale_vaapi=format=nv12"])
             else:
                 cmd.extend(["-c:v", vcodec, "-crf", str(self.crf_slider.value())])
                 if vcodec in ("libx264", "libx265"):
