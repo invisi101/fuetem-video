@@ -509,6 +509,54 @@ def _res_to_wh(label: str):
     return table.get(label)
 
 
+# Container → video/audio codecs that container can actually mux. Used to
+# catch guaranteed-failure combos (e.g. webm + libx264) before running ffmpeg.
+_CONTAINER_VCODECS = {
+    "mp4":  {"libx264", "libx265", "libaom-av1"},
+    "mov":  {"libx264", "libx265"},
+    "mkv":  {"libx264", "libx265", "libvpx-vp9", "libaom-av1"},
+    "webm": {"libvpx-vp9", "libaom-av1"},
+    "flv":  {"libx264"},
+    "ts":   {"libx264", "libx265"},
+    "avi":  {"libx264", "libx265"},
+}
+_CONTAINER_ACODECS = {
+    "mp4":  {"aac", "libmp3lame", "ac3"},
+    "mov":  {"aac", "libmp3lame", "ac3"},
+    "mkv":  {"aac", "libmp3lame", "libopus", "flac", "ac3"},
+    "webm": {"libopus"},
+    "flv":  {"aac", "libmp3lame"},
+    "ts":   {"aac", "libmp3lame", "ac3"},
+    "avi":  {"aac", "libmp3lame", "ac3"},
+}
+
+
+def _codec_container_problems(container: str, vcodec: str, acodec: str) -> list:
+    """Return human-readable problems for an incompatible container/codec mix.
+    'copy'/'none' are passed through (source-dependent, can't validate here)."""
+    problems = []
+    allowed_v = _CONTAINER_VCODECS.get(container)
+    if allowed_v is not None and vcodec not in ("copy", "none") and vcodec not in allowed_v:
+        problems.append(f"video codec '{vcodec}' can't be stored in .{container} "
+                        f"(supported: {', '.join(sorted(allowed_v))})")
+    allowed_a = _CONTAINER_ACODECS.get(container)
+    if allowed_a is not None and acodec not in ("copy", "none") and acodec not in allowed_a:
+        problems.append(f"audio codec '{acodec}' can't be stored in .{container} "
+                        f"(supported: {', '.join(sorted(allowed_a))})")
+    return problems
+
+
+def _safe_audio_codec(container: str) -> str:
+    """Pick a sensible audio codec that the given container accepts."""
+    allowed = _CONTAINER_ACODECS.get(container)
+    if not allowed:
+        return "aac"
+    for pref in ("aac", "libopus", "libmp3lame", "ac3", "flac"):
+        if pref in allowed:
+            return pref
+    return next(iter(allowed))
+
+
 # ── Workers ───────────────────────────────────────────────────────────────────
 
 class FFmpegWorker(QtCore.QThread):
@@ -541,12 +589,15 @@ class FFmpegWorker(QtCore.QThread):
             self.finished.emit(False, str(e))
             return
 
-        last_line = ""
+        # Keep a rolling buffer of the last few real log lines. With
+        # -progress pipe:1 the stream is dominated by "key=value" progress
+        # tokens; actual ffmpeg messages/errors have a non key=value first
+        # token, so use that to tell them apart and report something useful.
+        recent: list = []
         for line in (self._process.stdout or []):
             if self._cancelled:
                 break
             line = line.rstrip()
-            last_line = line
             if line.startswith("out_time_ms=") and self.total_seconds > 0:
                 try:
                     us = int(line.split("=", 1)[1])
@@ -554,12 +605,18 @@ class FFmpegWorker(QtCore.QThread):
                     self.progress.emit(pct)
                 except (ValueError, ZeroDivisionError):
                     pass
+            elif line and "=" not in line.split(" ", 1)[0]:
+                recent.append(line)
+                if len(recent) > 5:
+                    recent.pop(0)
 
         ret = self._process.wait()
         if self._cancelled:
             self.finished.emit(False, "Cancelled.")
+        elif ret == 0:
+            self.finished.emit(True, recent[-1] if recent else "")
         else:
-            self.finished.emit(ret == 0, last_line)
+            self.finished.emit(False, "\n".join(recent) or f"ffmpeg exited with code {ret}")
 
 
 class MultiCmdWorker(QtCore.QThread):
@@ -590,6 +647,9 @@ class MultiCmdWorker(QtCore.QThread):
             self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                           stderr=subprocess.DEVNULL)
             self._proc.wait()
+            if self._cancelled:
+                self.finished.emit(False, "Cancelled.")
+                return
             if self._proc.returncode != 0:
                 self.finished.emit(False, f"Step {i}/{total} failed.")
                 return
@@ -608,45 +668,73 @@ class ThumbnailWorker(QtCore.QThread):
         self.path  = path
         self.count = count
         self._cancelled = False
+        self._proc = None
 
     def cancel(self):
         self._cancelled = True
+        p = self._proc
+        if p:
+            try:
+                p.terminate()
+            except Exception:
+                pass
 
     def run(self):
-        if THUMB_DIR.exists():
-            shutil.rmtree(THUMB_DIR, ignore_errors=True)
-        THUMB_DIR.mkdir(parents=True, exist_ok=True)
-
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", self.path],
-            capture_output=True, text=True,
-        )
+        # finished must always fire (even on error/timeout/cancel) so the
+        # timeline's loading state is cleared; emit the count actually delivered.
+        emitted = 0
         try:
-            duration = float(r.stdout.strip())
-        except Exception:
-            self.finished.emit(0)
-            return
+            if THUMB_DIR.exists():
+                shutil.rmtree(THUMB_DIR, ignore_errors=True)
+            THUMB_DIR.mkdir(parents=True, exist_ok=True)
 
-        fps = min(self.count / duration, 2.0) if duration > 0 else 1.0
-        cmd = [
-            "ffmpeg", "-i", self.path,
-            "-vf", f"fps={fps:.6f},scale=-1:{self.THUMB_H}",
-            "-f", "image2", str(THUMB_DIR / "t_%04d.jpg"),
-        ]
-        subprocess.run(cmd, capture_output=True, timeout=120)
-
-        thumbs = sorted(THUMB_DIR.glob("t_*.jpg"))
-        for i, tp in enumerate(thumbs):
+            try:
+                self._proc = subprocess.Popen(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", self.path],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                out, _ = self._proc.communicate(timeout=30)
+            except Exception:
+                return
             if self._cancelled:
-                break
-            # QPixmap must only be built on the GUI thread; build a QImage
-            # here (thread-safe) and convert to QPixmap in the main-thread slot.
-            img = QtGui.QImage(str(tp))
-            if not img.isNull():
-                self.thumbnail_ready.emit(i, img)
+                return
+            try:
+                duration = float(out.strip())
+            except Exception:
+                return
 
-        self.finished.emit(len(thumbs))
+            fps = min(self.count / duration, 2.0) if duration > 0 else 1.0
+            cmd = [
+                "ffmpeg", "-i", self.path,
+                "-vf", f"fps={fps:.6f},scale=-1:{self.THUMB_H}",
+                "-f", "image2", str(THUMB_DIR / "t_%04d.jpg"),
+            ]
+            try:
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._proc.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            except Exception:
+                return
+            if self._cancelled:
+                return
+
+            thumbs = sorted(THUMB_DIR.glob("t_*.jpg"))
+            for i, tp in enumerate(thumbs):
+                if self._cancelled:
+                    break
+                # QPixmap must only be built on the GUI thread; build a QImage
+                # here (thread-safe) and convert to QPixmap in the main-thread slot.
+                img = QtGui.QImage(str(tp))
+                if not img.isNull():
+                    self.thumbnail_ready.emit(i, img)
+                    emitted += 1
+        finally:
+            self.finished.emit(emitted)
 
 
 # ── Widgets ───────────────────────────────────────────────────────────────────
@@ -1032,15 +1120,17 @@ class TrimSplitPage(QtWidgets.QWidget):
         if not out_dir:
             return
 
-        part1 = str(Path(out_dir) / f"{src.stem}_part1{ext}")
-        part2 = str(Path(out_dir) / f"{src.stem}_part2{ext}")
-        cmds = [
-            ["ffmpeg", "-y", "-i", self.ctrl.current_file,
-             "-t", f"{pos_s:.6f}", "-c", "copy", part1],
-            ["ffmpeg", "-y", "-ss", f"{pos_s:.6f}",
-             "-i", self.ctrl.current_file, "-c", "copy", part2],
+        # Segment muxer cuts at keyframes so the two parts are contiguous and
+        # non-overlapping (independent -ss + -c copy would snap each part back
+        # to a keyframe and duplicate frames at the boundary).
+        out_pat = str(Path(out_dir) / f"{src.stem}_part%02d{ext}")
+        cmd = [
+            "ffmpeg", "-y", "-i", self.ctrl.current_file,
+            "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_times", f"{pos_s:.6f}",
+            "-reset_timestamps", "1", out_pat,
         ]
-        self.ctrl._run_multi(cmds, "Splitting…")
+        self.ctrl._run_ffmpeg(cmd, 0, "Splitting…")
 
     def _do_split_equal(self):
         if not self.ctrl.current_file:
@@ -1054,17 +1144,18 @@ class TrimSplitPage(QtWidgets.QWidget):
         if not out_dir:
             return
 
+        # Cut at keyframes via the segment muxer so parts are contiguous and
+        # reassemble to the original (independent -ss + -c copy overlaps).
         seg_dur = dur / n
-        cmds = []
-        for i in range(n):
-            ss  = i * seg_dur
-            out = str(Path(out_dir) / f"{src.stem}_part{i+1:02d}{src.suffix}")
-            cmds.append([
-                "ffmpeg", "-y", "-ss", f"{ss:.6f}",
-                "-i", self.ctrl.current_file,
-                "-t", f"{seg_dur:.6f}", "-c", "copy", out,
-            ])
-        self.ctrl._run_multi(cmds, f"Splitting into {n} parts…")
+        times   = ",".join(f"{i * seg_dur:.6f}" for i in range(1, n))
+        out_pat = str(Path(out_dir) / f"{src.stem}_part%02d{src.suffix}")
+        cmd = [
+            "ffmpeg", "-y", "-i", self.ctrl.current_file,
+            "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_times", times,
+            "-reset_timestamps", "1", out_pat,
+        ]
+        self.ctrl._run_ffmpeg(cmd, 0, f"Splitting into {n} parts…")
 
     def _do_split_segments(self):
         if not self.ctrl.current_file:
@@ -1325,8 +1416,14 @@ class ConvertPage(QtWidgets.QWidget):
         else:
             vf = self._build_vf()
             if vaapi:
-                enc = "hevc_vaapi" if vcodec == "libx265" else "h264_vaapi"
-                cmd.extend(["-c:v", enc, "-qp", str(self.crf_slider.value())])
+                _vaapi_map = {"libx265": "hevc_vaapi",
+                              "libvpx-vp9": "vp9_vaapi",
+                              "libaom-av1": "av1_vaapi"}
+                enc = _vaapi_map.get(vcodec, "h264_vaapi")
+                qp = self.crf_slider.value()
+                if enc in ("h264_vaapi", "hevc_vaapi"):
+                    qp = min(qp, 51)   # H.264/HEVC qp tops out at 51
+                cmd.extend(["-c:v", enc, "-qp", str(qp)])
                 # h264_vaapi has no 10-bit profile, so a 10-bit HEVC/AV1 source
                 # fails with "No usable encoding profile found". Force a downconvert
                 # to 8-bit nv12. hevc_vaapi keeps native bit depth (handles p010).
@@ -1361,6 +1458,14 @@ class ConvertPage(QtWidgets.QWidget):
             abr = self.abr.currentText()
             if abr != "best":
                 cmd.extend(["-b:a", abr])
+
+        # Reject guaranteed-failure container/codec combos with a clear message
+        problems = _codec_container_problems(fmt, vcodec, acodec)
+        if problems:
+            QtWidgets.QMessageBox.warning(
+                self, "Incompatible format",
+                "This combination can't be written:\n  • " + "\n  • ".join(problems))
+            return
 
         # Extra args
         extra = self.extra_args.text().strip()
@@ -1820,7 +1925,14 @@ class FiltersPage(QtWidgets.QWidget):
         if af:
             cmd.extend(["-af", ",".join(af)])
 
-        cmd.extend(["-c:v", vcodec, "-crf", str(crf), "-c:a", "aac"])
+        acodec = _safe_audio_codec(fmt)
+        problems = _codec_container_problems(fmt, vcodec, acodec)
+        if problems:
+            QtWidgets.QMessageBox.warning(
+                self, "Incompatible format",
+                "This combination can't be written:\n  • " + "\n  • ".join(problems))
+            return
+        cmd.extend(["-c:v", vcodec, "-crf", str(crf), "-c:a", acodec])
         cmd.append(out)
         self.ctrl._run_ffmpeg(cmd, dur, "Applying filters…")
 
@@ -2002,7 +2114,8 @@ class AudioPage(QtWidgets.QWidget):
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file, "-vn"]
         if self.extract_norm.isChecked():
-            cmd.extend(["-af", "loudnorm"])
+            # loudnorm outputs 192 kHz; resample so AAC/MP3 encoders accept it
+            cmd.extend(["-af", "loudnorm,aresample=48000"])
         cmd.append(out)
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Extracting audio…")
 
@@ -2018,9 +2131,12 @@ class AudioPage(QtWidgets.QWidget):
         if not self.ctrl.current_file: return
         out = self._save_as("_norm.mp4")
         if not out: return
+        # loudnorm forces 192 kHz output; aresample back so the AAC/MP3
+        # encoder (and the mp4 container) will accept the stream.
         af = (f"loudnorm=I={self.norm_i.value():.1f}"
               f":TP={self.norm_tp.value():.1f}"
-              f":LRA={self.norm_lra.value():.1f}")
+              f":LRA={self.norm_lra.value():.1f}"
+              f",aresample=48000")
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file, "-af", af, "-c:v", "copy", out]
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Normalizing…")
@@ -2259,7 +2375,8 @@ class FramesPage(QtWidgets.QWidget):
         if mode == "Every N seconds":
             vf = f"fps=1/{n:.4f}"
         elif mode == "Every Nth frame":
-            vf = f"select='not(mod(n,{int(n)}))',setpts=N*AVTB"
+            nth = max(1, int(round(n)))   # avoid mod(n,0) and silent truncation
+            vf = f"select='not(mod(n,{nth}))',setpts=N*AVTB"
         else:
             vf = None
         cmd = ["ffmpeg", "-y", "-i", self.ctrl.current_file]
@@ -2430,7 +2547,11 @@ class MergePage(QtWidgets.QWidget):
 
         if self.concat_copy.isChecked():
             lst = Path(tempfile.gettempdir()) / "fuetem_concat.txt"
-            lst.write_text("\n".join(f"file '{p}'" for p in paths))
+            # concat demuxer: inside single quotes, ' must be written '\'' and
+            # backslashes doubled, else paths with apostrophes break/misparse.
+            lst.write_text("\n".join(
+                "file '%s'" % p.replace("\\", "\\\\").replace("'", "'\\''")
+                for p in paths))
             cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
                    "-i", str(lst), "-c", "copy", out]
             self.ctrl._run_ffmpeg(cmd, 0, "Merging (stream copy)…")
@@ -2564,7 +2685,9 @@ class SubtitlesPage(QtWidgets.QWidget):
         if not out: return
         enc  = self.burn_enc.text().strip() or "UTF-8"
         size = self.burn_size.value()
-        sub_escaped = sub.replace(":", "\\:")
+        # Filtergraph escaping: the path is wrapped in single quotes, so only
+        # backslash and single-quote are special here (a bare colon is literal).
+        sub_escaped = sub.replace("\\", "\\\\").replace("'", "'\\''")
         vf = f"subtitles='{sub_escaped}':charenc={enc}:force_style='FontSize={size}'"
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file,
@@ -2582,7 +2705,12 @@ class SubtitlesPage(QtWidgets.QWidget):
         out  = self._save_as("_subbed" + ext)
         if not out: return
         lang = self.soft_lang.text().strip() or "eng"
-        scodec = "mov_text" if ext in (".mp4", ".m4v") else "copy"
+        if ext in (".mp4", ".m4v", ".mov"):
+            scodec = "mov_text"
+        elif ext == ".webm":
+            scodec = "webvtt"
+        else:
+            scodec = "srt"   # mkv and friends accept text subs as srt
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file, "-i", sub,
                "-c", "copy", "-c:s", scodec,
@@ -3135,14 +3263,27 @@ class PrivacyPage(QtWidgets.QWidget):
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file]
 
-        # stream mapping
+        # Stream mapping. Build the kept-stream list and record each stream's
+        # index in the OUTPUT file so the per-stream -metadata below targets the
+        # right stream. (Previously a grouped enumerate index was applied to a
+        # "-map 0" output that preserves the *input* order — a mismatch whenever
+        # the source order wasn't video→audio→subtitle.)
         if remove_data:
-            for s in (pd.get("video_streams", []) +
-                      pd.get("audio_streams", []) +
-                      pd.get("subtitle_streams", [])):
+            kept_streams = (pd.get("video_streams", []) +
+                            pd.get("audio_streams", []) +
+                            pd.get("subtitle_streams", []))
+            for s in kept_streams:
                 cmd += ["-map", f"0:{s['index']}"]
+            # data streams dropped → output renumbered in this grouped order
+            stream_out_index = {id(s): i for i, s in enumerate(kept_streams)}
         else:
             cmd += ["-map", "0"]
+            kept_streams = (pd.get("video_streams", []) +
+                            pd.get("audio_streams", []) +
+                            pd.get("subtitle_streams", []) +
+                            pd.get("data_streams", []))
+            # -map 0 preserves input order, so output index == input index
+            stream_out_index = {id(s): s.get("index") for s in kept_streams}
 
         # format-level: clear all, re-add unchecked
         checked_fmt_keys = {self._rows[r]["key"]
@@ -3154,13 +3295,10 @@ class PrivacyPage(QtWidgets.QWidget):
                 cmd += ["-metadata", f"{k}={v}"]
 
         # per-stream: only touch streams that have checked tags
-        kept_streams = (pd.get("video_streams", []) +
-                        pd.get("audio_streams", []) +
-                        pd.get("subtitle_streams", []))
-        if not remove_data:
-            kept_streams += pd.get("data_streams", [])
-
-        for out_i, s in enumerate(kept_streams):
+        for s in kept_streams:
+            out_i = stream_out_index.get(id(s))
+            if out_i is None:
+                continue
             in_idx = s.get("index")
             stream_tags = s.get("tags", {})
             if not stream_tags:
@@ -3629,7 +3767,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── FFmpeg runner interface (called by pages) ─────────────────────────────
 
+    def _op_running(self) -> bool:
+        return ((self._ffmpeg_worker is not None and self._ffmpeg_worker.isRunning()) or
+                (self._multi_worker is not None and self._multi_worker.isRunning()))
+
     def _run_ffmpeg(self, cmd: list, dur: float = 0.0, status: str = "Processing…"):
+        if self._op_running():
+            QtWidgets.QMessageBox.information(
+                self, "Busy", "An operation is already running — cancel it or wait "
+                "for it to finish before starting another.")
+            return
         self._set_status(status)
         self._set_busy(True)
         self._ffmpeg_worker = FFmpegWorker(cmd, dur)
@@ -3638,6 +3785,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ffmpeg_worker.start()
 
     def _run_multi(self, cmds: list, status: str = "Processing…"):
+        if self._op_running():
+            QtWidgets.QMessageBox.information(
+                self, "Busy", "An operation is already running — cancel it or wait "
+                "for it to finish before starting another.")
+            return
         self._set_status(status)
         self._set_busy(True)
         self._multi_worker = MultiCmdWorker(cmds)
@@ -3652,6 +3804,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_busy(False)
         if ok:
             self._set_status(f"Done. {msg}")
+        elif msg == "Cancelled.":
+            self._set_status("Cancelled.")
         else:
             self._set_status(f"Error: {msg}")
             QtWidgets.QMessageBox.warning(self, "FFmpeg Error", msg)
@@ -3687,6 +3841,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if Path(path).suffix.lower() in VIDEO_EXTS:
                 self._load_file(path)
                 break
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        # Stop any running workers before Qt tears down their QThread objects,
+        # else we abort with "QThread: Destroyed while thread is still running".
+        for w in (self._ffmpeg_worker, self._multi_worker,
+                  getattr(self.timeline, "_worker", None)):
+            if w is not None and w.isRunning():
+                try:
+                    w.cancel()
+                except Exception:
+                    pass
+                w.wait(5000)
+        super().closeEvent(event)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
