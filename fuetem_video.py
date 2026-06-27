@@ -706,6 +706,12 @@ class ThumbnailWorker(QtCore.QThread):
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
                 out, _ = self._proc.communicate(timeout=30)
             except Exception:
+                if self._proc:           # reap so a timed-out ffprobe can't zombie
+                    try:
+                        self._proc.kill()
+                        self._proc.communicate()
+                    except Exception:
+                        pass
                 return
             if self._cancelled:
                 return
@@ -727,6 +733,7 @@ class ThumbnailWorker(QtCore.QThread):
             except subprocess.TimeoutExpired:
                 try:
                     self._proc.kill()
+                    self._proc.communicate()   # reap the killed process (no zombie)
                 except Exception:
                     pass
             except Exception:
