@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import shlex
 from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -33,7 +34,7 @@ AUDIO_BR      = ["best", "320k", "256k", "192k", "128k", "96k", "64k"]
 FRAME_FMTS    = ["png", "jpg", "bmp", "tiff", "webp"]
 SUB_FMTS      = ["srt", "ass", "vtt"]
 SPEED_VALUES  = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0]
-OVERLAY_POS   = ["Top-Left", "Top-Right", "Centre", "Bottom-Left", "Bottom-Right", "Custom"]
+OVERLAY_POS   = ["Top-Left", "Top-Right", "Centre", "Bottom-Left", "Bottom-Right"]
 
 VAAPI_DEVICE = "/dev/dri/renderD128"
 MAX_THUMBS   = 80
@@ -351,10 +352,11 @@ def _ms_to_hms(ms: int) -> str:
 
 
 def _secs_to_timestr(secs: float) -> str:
-    h = int(secs // 3600)
-    m = int((secs % 3600) // 60)
-    s = secs % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
+    # Round to ms first so values just under a minute don't format as ":60.000".
+    total_ms = round(secs * 1000)
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    return f"{h:02d}:{m:02d}:{rem / 1000:06.3f}"
 
 
 def _timestr_to_secs(text: str) -> float:
@@ -372,7 +374,8 @@ def _timestr_to_secs(text: str) -> float:
 
 def _load_recent() -> list:
     try:
-        return json.loads(RECENT_FILE.read_text())
+        data = json.loads(RECENT_FILE.read_text())
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -403,9 +406,14 @@ def _probe(path: str) -> dict:
     fmt     = data.get("format", {})
     streams = data.get("streams", [])
 
-    result["duration"]    = float(fmt.get("duration", 0) or 0)
-    result["size"]        = int(fmt.get("size", 0) or 0)
-    result["bit_rate"]    = int(fmt.get("bit_rate", 0) or 0)
+    def _num(v, conv):
+        try:
+            return conv(v)
+        except (TypeError, ValueError):
+            return conv(0)
+    result["duration"]    = _num(fmt.get("duration", 0) or 0, float)
+    result["size"]        = _num(fmt.get("size", 0) or 0, int)
+    result["bit_rate"]    = _num(fmt.get("bit_rate", 0) or 0, int)
     result["format_name"] = fmt.get("format_name", "")
     result["tags"]        = fmt.get("tags", {})
 
@@ -464,6 +472,8 @@ def _probe(path: str) -> dict:
 
 def _atempo_chain(speed: float) -> list:
     """Build a list of atempo filter strings for the given speed multiplier."""
+    if speed <= 0:
+        return []
     filters = []
     remaining = speed
     while remaining > 2.0:
@@ -571,13 +581,14 @@ class FFmpegWorker(QtCore.QThread):
         self._cancelled = False
 
     def cancel(self):
+        # Only signal/terminate here — the worker thread reaps the process via
+        # its own wait(), so the GUI thread (which calls cancel) never blocks.
         self._cancelled = True
         if self._process:
             try:
                 self._process.terminate()
-                self._process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -754,9 +765,17 @@ class ThumbnailTimeline(QtWidgets.QWidget):
         self._worker: ThumbnailWorker | None = None
 
     def load_file(self, path: str, duration: float):
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait()
+        if self._worker:
+            if self._worker.isRunning():
+                self._worker.cancel()
+                self._worker.wait()
+            # Drop the old worker's connections so its trailing finished signal
+            # can't clear the new load's "loading" state.
+            try:
+                self._worker.thumbnail_ready.disconnect()
+                self._worker.finished.disconnect()
+            except Exception:
+                pass
         self.clear()
         self.set_loading(True)
         count = min(MAX_THUMBS, max(20, int(self.width() / 12) or 40))
@@ -812,11 +831,11 @@ class ThumbnailTimeline(QtWidgets.QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == QtCore.Qt.LeftButton:
-            self.seek_requested.emit(e.x() / self.width())
+            self.seek_requested.emit(max(0.0, min(1.0, e.x() / (self.width() or 1))))
 
     def mouseMoveEvent(self, e):
         if e.buttons() & QtCore.Qt.LeftButton:
-            self.seek_requested.emit(max(0.0, min(1.0, e.x() / self.width())))
+            self.seek_requested.emit(max(0.0, min(1.0, e.x() / (self.width() or 1))))
 
 
 class TimeSpinWidget(QtWidgets.QWidget):
@@ -1102,7 +1121,7 @@ class TrimSplitPage(QtWidgets.QWidget):
         else:
             vcodec = self.trim_vcodec.currentText()
             cmd.extend(["-c:v", vcodec, "-crf", str(self.trim_crf.value()),
-                        "-c:a", "copy"])
+                        "-c:a", _safe_audio_codec(fmt)])
         cmd.append(out)
         self.ctrl._run_ffmpeg(cmd, dur, f"Trimming…")
 
@@ -1110,9 +1129,10 @@ class TrimSplitPage(QtWidgets.QWidget):
         if not self.ctrl.current_file:
             return
         pos_s  = self.ctrl.player.position() / 1000
-        if pos_s <= 0:
+        dur    = self.ctrl.probe_data.get("duration", 0)
+        if pos_s <= 0 or (dur and pos_s >= dur):
             QtWidgets.QMessageBox.warning(self, "No Position",
-                                          "Seek to a position first.")
+                                          "Seek to a position inside the clip first.")
             return
         src = Path(self.ctrl.current_file)
         ext = src.suffix
@@ -1125,12 +1145,13 @@ class TrimSplitPage(QtWidgets.QWidget):
         # to a keyframe and duplicate frames at the boundary).
         out_pat = str(Path(out_dir) / f"{src.stem}_part%02d{ext}")
         cmd = [
-            "ffmpeg", "-y", "-i", self.ctrl.current_file,
+            "ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
+            "-i", self.ctrl.current_file,
             "-c", "copy", "-map", "0",
             "-f", "segment", "-segment_times", f"{pos_s:.6f}",
             "-reset_timestamps", "1", out_pat,
         ]
-        self.ctrl._run_ffmpeg(cmd, 0, "Splitting…")
+        self.ctrl._run_ffmpeg(cmd, dur, "Splitting…")
 
     def _do_split_equal(self):
         if not self.ctrl.current_file:
@@ -1150,12 +1171,13 @@ class TrimSplitPage(QtWidgets.QWidget):
         times   = ",".join(f"{i * seg_dur:.6f}" for i in range(1, n))
         out_pat = str(Path(out_dir) / f"{src.stem}_part%02d{src.suffix}")
         cmd = [
-            "ffmpeg", "-y", "-i", self.ctrl.current_file,
+            "ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
+            "-i", self.ctrl.current_file,
             "-c", "copy", "-map", "0",
             "-f", "segment", "-segment_times", times,
             "-reset_timestamps", "1", out_pat,
         ]
-        self.ctrl._run_ffmpeg(cmd, 0, f"Splitting into {n} parts…")
+        self.ctrl._run_ffmpeg(cmd, dur, f"Splitting into {n} parts…")
 
     def _do_split_segments(self):
         if not self.ctrl.current_file:
@@ -1165,15 +1187,17 @@ class TrimSplitPage(QtWidgets.QWidget):
         if not out_dir:
             return
         seg_t   = self.split_secs.value()
+        dur     = self.ctrl.probe_data.get("duration", 0)
         out_pat = str(Path(out_dir) / f"{src.stem}_%03d{src.suffix}")
         cmd = [
-            "ffmpeg", "-y", "-i", self.ctrl.current_file,
+            "ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
+            "-i", self.ctrl.current_file,
             "-c", "copy", "-map", "0",
             "-segment_time", f"{seg_t:.1f}",
             "-reset_timestamps", "1",
             "-f", "segment", out_pat,
         ]
-        self.ctrl._run_ffmpeg(cmd, 0, f"Splitting every {seg_t:.0f}s…")
+        self.ctrl._run_ffmpeg(cmd, dur, f"Splitting every {seg_t:.0f}s…")
 
 
 # ── Page: Convert ─────────────────────────────────────────────────────────────
@@ -1356,6 +1380,12 @@ class ConvertPage(QtWidgets.QWidget):
             self.crf_slider.setValue(35)
         else:
             self.crf_slider.setRange(0, 51)
+        # Two-pass only helps bitrate-targeted VP9 here; with CRF (x264/x265)
+        # the stats file is ignored, so pass 1 would just be wasted compute.
+        tp_ok = codec == "libvpx-vp9"
+        self.twopass_cb.setEnabled(not disabled and tp_ok)
+        if not tp_ok:
+            self.twopass_cb.setChecked(False)
 
     def _on_vaapi_toggled(self, checked: bool):
         self.twopass_cb.setEnabled(not checked)
@@ -1376,7 +1406,7 @@ class ConvertPage(QtWidgets.QWidget):
             h = self.custom_h.value()
             if self.aspect_lock.isChecked():
                 return f"scale={w}:-2"
-            return f"scale={w}:{h}"
+            return f"scale={w - w % 2}:{h - h % 2}"   # even dims for yuv420p
         wh = _res_to_wh(res)
         if not wh:
             return None
@@ -1428,7 +1458,8 @@ class ConvertPage(QtWidgets.QWidget):
                 # fails with "No usable encoding profile found". Force a downconvert
                 # to 8-bit nv12. hevc_vaapi keeps native bit depth (handles p010).
                 if vf:
-                    vaapi_scale = vf.replace("scale=", "scale_vaapi=")
+                    # scale_vaapi doesn't accept the -2 (round-to-even) form
+                    vaapi_scale = vf.replace("scale=", "scale_vaapi=").replace(":-2", ":-1")
                     if enc == "h264_vaapi":
                         vaapi_scale += ":format=nv12"
                     cmd.extend(["-vf", vaapi_scale])
@@ -1467,10 +1498,13 @@ class ConvertPage(QtWidgets.QWidget):
                 "This combination can't be written:\n  • " + "\n  • ".join(problems))
             return
 
-        # Extra args
+        # Extra args (respect quotes/spaces, e.g. -metadata title="My Film")
         extra = self.extra_args.text().strip()
         if extra:
-            cmd.extend(extra.split())
+            try:
+                cmd.extend(shlex.split(extra))
+            except ValueError:
+                cmd.extend(extra.split())
 
         cmd.append(out)
 
@@ -1811,7 +1845,9 @@ class FiltersPage(QtWidgets.QWidget):
 
         # Crop
         if self.crop_enabled.isChecked():
-            vf.append(f"crop={self.crop_w.value()}:{self.crop_h.value()}"
+            cw = self.crop_w.value() - self.crop_w.value() % 2   # even for yuv420p
+            ch = self.crop_h.value() - self.crop_h.value() % 2
+            vf.append(f"crop={cw}:{ch}"
                       f":{self.crop_x.value()}:{self.crop_y.value()}")
 
         # Resize
@@ -1822,7 +1858,8 @@ class FiltersPage(QtWidgets.QWidget):
                 if self.r_aspect.isChecked():
                     vf.append(f"scale={w}:-2")
                 else:
-                    vf.append(f"scale={w}:{self.rh.value()}")
+                    vf.append(f"scale={w - w % 2}:"
+                              f"{self.rh.value() - self.rh.value() % 2}")
             else:
                 wh = _res_to_wh(res)
                 if wh:
@@ -1847,7 +1884,16 @@ class FiltersPage(QtWidgets.QWidget):
             if self.pitch_cb.isChecked():
                 af.extend(_atempo_chain(speed))
             else:
-                af.extend(_atempo_chain(speed) + ["aresample=async=1"])
+                # No pitch correction: shift the sample rate so pitch changes
+                # with speed (chipmunk/deep), then resample back for playback.
+                sr = 48000
+                astr = pd.get("audio_streams", [])
+                if astr:
+                    try:
+                        sr = int(astr[0].get("sample_rate", 48000))
+                    except (TypeError, ValueError):
+                        sr = 48000
+                af.extend([f"asetrate={int(sr * speed)}", f"aresample={sr}"])
 
         # Colour eq
         br = self.brightness.value() / 100.0
@@ -2096,11 +2142,21 @@ class AudioPage(QtWidgets.QWidget):
 
     def _save_as(self, suffix_hint: str) -> str | None:
         src = Path(self.ctrl.current_file)
+        # Default to the SOURCE container so "-c:v copy" stays valid (an .mp4
+        # default can't hold VP9/AV1 video, etc.); ignore any ext in the hint.
+        label = suffix_hint.rsplit(".", 1)[0]
         out, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save Output",
-            str(src.parent / f"{src.stem}{suffix_hint}"),
+            str(src.parent / f"{src.stem}{label}{src.suffix}"),
             "All Files (*)")
         return out or None
+
+    def _has_audio(self) -> bool:
+        if not self.ctrl.probe_data.get("audio_streams"):
+            QtWidgets.QMessageBox.warning(self, "No Audio",
+                                          "This file has no audio stream.")
+            return False
+        return True
 
     def _do_extract(self):
         if not self.ctrl.current_file: return
@@ -2128,7 +2184,7 @@ class AudioPage(QtWidgets.QWidget):
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Removing audio…")
 
     def _do_normalize(self):
-        if not self.ctrl.current_file: return
+        if not self.ctrl.current_file or not self._has_audio(): return
         out = self._save_as("_norm.mp4")
         if not out: return
         # loudnorm forces 192 kHz output; aresample back so the AAC/MP3
@@ -2138,21 +2194,23 @@ class AudioPage(QtWidgets.QWidget):
               f":LRA={self.norm_lra.value():.1f}"
               f",aresample=48000")
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
-               "-i", self.ctrl.current_file, "-af", af, "-c:v", "copy", out]
+               "-i", self.ctrl.current_file, "-af", af, "-c:v", "copy",
+               "-c:a", _safe_audio_codec(Path(out).suffix.lstrip(".")), out]
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Normalizing…")
 
     def _do_volume(self):
-        if not self.ctrl.current_file: return
+        if not self.ctrl.current_file or not self._has_audio(): return
         out = self._save_as("_vol.mp4")
         if not out: return
         db = self.vol_slider.value()
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file,
-               "-af", f"volume={db}dB", "-c:v", "copy", out]
+               "-af", f"volume={db}dB", "-c:v", "copy",
+               "-c:a", _safe_audio_codec(Path(out).suffix.lstrip(".")), out]
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Adjusting volume…")
 
     def _do_delay(self):
-        if not self.ctrl.current_file: return
+        if not self.ctrl.current_file or not self._has_audio(): return
         out = self._save_as("_delay.mp4")
         if not out: return
         ms = self.delay_ms.value()
@@ -2162,11 +2220,12 @@ class AudioPage(QtWidgets.QWidget):
             af = f"atrim=start={abs(ms)/1000:.3f},asetpts=PTS-STARTPTS"
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file,
-               "-af", af, "-c:v", "copy", out]
+               "-af", af, "-c:v", "copy",
+               "-c:a", _safe_audio_codec(Path(out).suffix.lstrip(".")), out]
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Applying delay…")
 
     def _do_afade(self):
-        if not self.ctrl.current_file: return
+        if not self.ctrl.current_file or not self._has_audio(): return
         out = self._save_as("_afade.mp4")
         if not out: return
         dur = self.ctrl.probe_data.get("duration", 0)
@@ -2181,7 +2240,8 @@ class AudioPage(QtWidgets.QWidget):
             return
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file,
-               "-af", ",".join(parts), "-c:v", "copy", out]
+               "-af", ",".join(parts), "-c:v", "copy",
+               "-c:a", _safe_audio_codec(Path(out).suffix.lstrip(".")), out]
         self.ctrl._run_ffmpeg(cmd, dur, "Applying audio fade…")
 
     def _do_replace(self):
@@ -2196,9 +2256,11 @@ class AudioPage(QtWidgets.QWidget):
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file]
         if offset > 0:
-            cmd.extend(["-ss", f"{offset:.3f}"])
+            cmd.extend(["-itsoffset", f"{offset:.3f}"])   # delay the new audio
         cmd.extend(["-i", audio_path,
-                    "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", _safe_audio_codec(Path(out).suffix.lstrip(".")),
+                    "-map", "0:v:0", "-map", "1:a:0",
                     "-shortest", out])
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Replacing audio…")
 
@@ -2403,7 +2465,7 @@ class FramesPage(QtWidgets.QWidget):
         w     = self.gif_w.value()
         dith  = self.gif_dither.currentText()
         loops = self.gif_loops.value()
-        pal   = str(Path(tempfile.gettempdir()) / "fuetem_palette.png")
+        pal   = str(Path(tempfile.gettempdir()) / f"fuetem_palette_{Path(out).stem}.png")
         vf    = f"fps={fps},scale={w}:-1:flags=lanczos"
         cmd1 = ["ffmpeg", "-y",
                 "-ss", f"{start_s:.3f}", "-t", f"{dur:.3f}",
@@ -2450,6 +2512,7 @@ class FramesPage(QtWidgets.QWidget):
                "-framerate", f"{fps:.3f}",
                "-pattern_type", "glob",
                "-i", str(Path(folder) / pat),
+               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",   # even dims for yuv420p
                "-c:v", codec, "-pix_fmt", "yuv420p", out]
         self.ctrl._run_ffmpeg(cmd, 0, "Building video from images…")
 
@@ -2546,7 +2609,7 @@ class MergePage(QtWidgets.QWidget):
         if not out: return
 
         if self.concat_copy.isChecked():
-            lst = Path(tempfile.gettempdir()) / "fuetem_concat.txt"
+            lst = Path(tempfile.gettempdir()) / f"fuetem_concat_{Path(out).stem}.txt"
             # concat demuxer: inside single quotes, ' must be written '\'' and
             # backslashes doubled, else paths with apostrophes break/misparse.
             lst.write_text("\n".join(
@@ -2557,6 +2620,17 @@ class MergePage(QtWidgets.QWidget):
             self.ctrl._run_ffmpeg(cmd, 0, "Merging (stream copy)…")
         else:
             n      = len(paths)
+            # The concat filter references v:0 and a:0 of every input, so a file
+            # missing either stream makes ffmpeg abort. Check up front.
+            missing = [Path(p).name for p in paths
+                       if not (_probe(p).get("video_streams")
+                               and _probe(p).get("audio_streams"))]
+            if missing:
+                QtWidgets.QMessageBox.warning(
+                    self, "Cannot re-encode merge",
+                    "Re-encode merge needs every file to have both a video and an "
+                    "audio stream. These are missing one:\n  • " + "\n  • ".join(missing))
+                return
             inputs = []
             for p in paths:
                 inputs.extend(["-i", p])
@@ -2713,6 +2787,7 @@ class SubtitlesPage(QtWidgets.QWidget):
             scodec = "srt"   # mkv and friends accept text subs as srt
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file, "-i", sub,
+               "-map", "0", "-map", "1",
                "-c", "copy", "-c:s", scodec,
                "-metadata:s:s:0", f"language={lang}", out]
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Adding subtitle…")
@@ -2815,7 +2890,8 @@ class MetadataPage(QtWidgets.QWidget):
                "-i", self.ctrl.current_file]
         for key, le in self._fields.items():
             val = le.text().strip()
-            cmd.extend(["-metadata", f"{key}={val}"])
+            if val:   # blank field shouldn't wipe an existing tag
+                cmd.extend(["-metadata", f"{key}={val}"])
         cmd.extend(["-c", "copy", out])
         self.ctrl._run_ffmpeg(cmd, self.ctrl.probe_data.get("duration", 0), "Saving tags…")
 
@@ -2991,10 +3067,11 @@ class AnalysePage(QtWidgets.QWidget):
             str(src.parent / f"{src.stem}_clean{src.suffix}"),
             "All Files (*)")
         if not out: return
-        # -map 0:v -map 0:a keeps only video and audio, dropping all data/timecode tracks
+        # Keep video/audio/subtitles, drop data/timecode tracks. Optional maps
+        # so audio-only or subtitle-less files don't error out.
         cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
                "-i", self.ctrl.current_file,
-               "-map", "0:v", "-map", "0:a?",
+               "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
                "-c", "copy", out]
         self.ctrl._run_ffmpeg(
             cmd, self.ctrl.probe_data.get("duration", 0),
@@ -3010,18 +3087,23 @@ class AnalysePage(QtWidgets.QWidget):
             def __init__(self, path):
                 super().__init__(); self.path = path
             def run(self):
-                r = subprocess.run(
-                    ["ffmpeg", "-v", "error", "-i", self.path, "-f", "null", "-"],
-                    capture_output=True, text=True)
-                errors = r.stderr.strip()
-                self.done.emit(errors if errors else "No errors detected.")
+                try:
+                    r = subprocess.run(
+                        ["ffmpeg", "-v", "error", "-i", self.path, "-f", "null", "-"],
+                        capture_output=True, text=True)
+                    errors = r.stderr.strip()
+                    self.done.emit(errors if errors else "No errors detected.")
+                except Exception as e:
+                    self.done.emit(f"Could not run check: {e}")
 
+        self.error_btn.setEnabled(False)
         self._err_runner = _Runner(self.ctrl.current_file)
         self._err_runner.done.connect(self._on_check_done)
         self._err_runner.start()
 
     def _on_check_done(self, msg: str):
         self.ctrl._set_busy(False)
+        self.error_btn.setEnabled(True)
         self.ctrl._set_status("Error check complete.")
         QtWidgets.QMessageBox.information(self, "Error Check", msg)
 
@@ -3291,7 +3373,7 @@ class PrivacyPage(QtWidgets.QWidget):
                             if self._rows[r]["stream_in"] is None}
         cmd += ["-map_metadata", "-1"]
         for k, v in fmt_tags.items():
-            if k.lower() not in _NEVER_REMOVE and k not in checked_fmt_keys:
+            if k.lower() in _NEVER_REMOVE or k not in checked_fmt_keys:
                 cmd += ["-metadata", f"{k}={v}"]
 
         # per-stream: only touch streams that have checked tags
@@ -3310,7 +3392,7 @@ class PrivacyPage(QtWidgets.QWidget):
                 continue
             cmd += [f"-map_metadata:s:{out_i}", "-1"]
             for k, v in stream_tags.items():
-                if k.lower() not in _NEVER_REMOVE and k not in checked_stream_keys:
+                if k.lower() in _NEVER_REMOVE or k not in checked_stream_keys:
                     cmd += [f"-metadata:s:{out_i}", f"{k}={v}"]
 
         cmd += ["-c", "copy", out]
@@ -3729,6 +3811,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.current_file = path
         self.probe_data = _probe(path)
+        if not self.probe_data:
+            QtWidgets.QMessageBox.warning(
+                self, "Could not read file",
+                "Couldn't read this file's media info (is ffprobe installed and "
+                "the file valid?). Some operations may not work correctly.")
         _add_to_recent(path)
 
         self.file_name_label.setText(Path(path).name)
@@ -3861,6 +3948,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Fuetem Video")
     font = app.font()
